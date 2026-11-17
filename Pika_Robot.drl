@@ -1,0 +1,212 @@
+# =====================================================
+#  보조배터리 대여/반납/고장 처리 로봇 프로그램 (DRL)
+# =====================================================
+#
+#  [PLC가 보내는 신호 - 컨트롤러 디지털 출력]
+#   DO1 = 1번칸    DO2 = 2번칸    DO3 = 3번칸
+#   DO4 = 4번칸    DO5 = 5번칸    DO6 = 6번칸
+#   DO7 = 대여     DO8 = 반납     DO9 = 고장
+#   DO10 = 대여/반납 때: 대기 위치로 들어가도 된다는 신호
+#   DO12 = 켜지면 홈으로 이동 (켜져 있는 동안은 홈에서 대기)
+#   예) DO1 + DO7 = 1번칸 대여
+#
+#  [로봇이 보내는 신호]
+#   DO11 = 이동 중 신호 (MFC창 표시용). 작업 한 번에 두 번 켜짐
+#          1번째 : 홈 -> 집는 곳의 접근 위치 (대여/고장: 칸, 반납: wait)
+#          2번째 : 집은 뒤 -> 놓는 곳의 접근 위치
+#                  (대여: rent_wait에서 DO10이 들어올 때까지, 반납: 칸, 고장: broken)
+#          두 이동 사이(집는 동안)에는 반드시 꺼져 있어야 PLC가 2번째를 구분함
+#
+#  [그리퍼 (공압)]
+#   DO15 = 열기     DO16 = 잡기
+#
+#  [PLC / MFC 작업 단계와의 관계]
+#   1 작업 접수     : DO7 / DO8 / DO9 켜짐 (PLC가 켬)
+#   2 1번째 이동    : DO11 켜짐 (1번째)
+#   3 파지          : DO16 켜짐 + DO15 꺼짐
+#   4 2번째 이동    : DO11 켜짐 (2번째)
+#   5 배출 / 삽입   : DO15 켜짐 + DO16 꺼짐 (놓기)
+#   6 완료          : 로봇이 DO1~DO9를 끔 (clear_signals)
+#
+#  [티칭 위치]
+#   System_Home            = 홈
+#   System_waypoint        = 홈 <-> 대기 위치 사이 경유 위치
+#   System_wait            = 반납 때 배터리를 집는 대기 위치
+#   System_rent_wait       = 대여 때 배터리를 놓는 대기 위치
+#   System_slot01 ~ 06     = 칸 1~6번 (충전기가 꽂힌 위치)
+#   System_broken          = 고장 배터리 놓는 곳
+# =====================================================
+
+
+# ---------- 1. 설정값 ----------
+GRIP_OPEN = 15         # 그리퍼 열기 출력 번호
+GRIP_CLOSE = 16        # 그리퍼 잡기 출력 번호
+APP = 100              # 접근 거리(mm): 물건 위치 앞에서 멈출 거리
+
+DO_SLOT_FIRST = 1      # 칸 신호 시작 번호 (DO1 = 1번칸 ... DO6 = 6번칸)
+DO_RENT = 7            # 대여 신호 번호
+DO_RETURN = 8          # 반납 신호 번호
+DO_BROKEN = 9          # 고장 신호 번호
+DO_WAIT_GO = 10        # 대기 위치에 들어가도 된다는 PLC 신호 (대여/반납)
+DO_MOVING = 11         # 이동 중 신호 (MFC창 표시용)
+DO_RESET = 12          # 켜지면 홈으로 이동
+
+
+# ---------- 2. 그리퍼 동작 ----------
+def grip_open():
+    # 잡기 끄고 -> 열기 켜기 -> 0.5초 대기
+    set_digital_output(GRIP_CLOSE, OFF)
+    set_digital_output(GRIP_OPEN, ON)
+    wait(0.5)
+
+def grip_close():
+    # 열기 끄고 -> 잡기 켜기 -> 0.5초 대기
+    set_digital_output(GRIP_OPEN, OFF)
+    set_digital_output(GRIP_CLOSE, ON)
+    wait(0.5)
+
+
+# ---------- 3. 이동 중 신호 ----------
+def moving_on():
+    set_digital_output(DO_MOVING, ON)
+
+def moving_off():
+    set_digital_output(DO_MOVING, OFF)
+
+
+# ---------- 4. 이동 동작 ----------
+def go_home():
+    # 홈 위치로 이동
+    movel(System_Home, vel=150, acc=300)
+
+def app_base(p):
+    # 접근 위치(베이스 기준): 위치 p에서 로봇 베이스 Z축 방향으로 100mm 위
+    # -> System_wait, System_rent_wait, System_broken 위치에 사용
+    return trans(p, [0, 0, APP, 0, 0, 0], DR_BASE, DR_BASE)
+
+def app_tool(p):
+    # 접근 위치(툴 기준): 위치 p에서 툴 Z 방향으로 100mm 뒤로 물러난 지점
+    # -> 칸(1~6번) 위치에 사용
+    return trans(p, [0, 0, -APP, 0, 0, 0], DR_TOOL, DR_BASE)
+
+def go_wait_app(p):
+    # 홈 -> 경유 위치 -> p의 접근 위치 (p = System_wait 또는 System_rent_wait)
+    movel(System_waypoint, vel=150, acc=300, radius=100)         # 홈에서 경유 위치로 (직선)
+    movel(app_base(p), vel=150, acc=300)             # 경유 위치에서 접근 위치로 (직선)
+
+def back_home_from_wait():
+    # 대기 위치의 접근 위치 -> 경유 위치 -> 홈
+    movel(System_waypoint, vel=150, acc=300, radius=100)         # 접근 위치에서 경유 위치로 (직선)
+    movel(System_Home, vel=150, acc=300)             # 경유 위치에서 홈으로 (직선)
+
+def pick_from(p, app):
+    # p 위치에서 배터리 집기 (app = 접근 위치 만드는 함수)
+    # 1번째 이동(DO11)은 접근 위치에 도착하면 끄고, 그 다음에 집음
+    grip_open()                          # 1) 그리퍼 열기 (이동 전에)
+    moving_on()                          # 2) DO11 켜기 : 1번째 이동 시작
+    movel(app(p), vel=150, acc=300)      # 3) 접근 위치로 이동
+    moving_off()                         # 4) DO11 끄기 : 접근 위치 도착
+    movel(p, vel=50, acc=100)            # 5) 집는 위치로 천천히 이동
+    grip_close()                         # 6) 배터리 잡기 (단계 3)
+    movel(app(p), vel=50, acc=100)       # 7) 접근 위치로 다시 빠져나옴
+
+def wait_plc_go():
+    # PLC가 DO10을 켤 때까지 0.1초마다 확인하며 대기
+    while get_digital_output(DO_WAIT_GO) == OFF:
+        wait(0.1)
+
+
+# ---------- 5. 티칭한 칸 위치 ----------
+slots = [System_slot01, System_slot02, System_slot03,
+         System_slot04, System_slot05, System_slot06]
+# slots[0] = 1번칸 ... slots[5] = 6번칸
+
+
+# ---------- 6. 신호 읽기 / 신호 지우기 ----------
+def read_slot():
+    # DO1~DO6 중 켜진 칸을 찾아서 번호(0~5) 반환
+    # 켜진 칸이 없으면 -1 반환
+    for i in range(6):
+        if get_digital_output(DO_SLOT_FIRST + i) == ON:
+            return i
+    return -1
+
+def clear_signals():
+    # 동작이 끝나면 PLC 신호(DO1~DO9)를 모두 끔
+    # PLC는 DO7/8/9가 꺼지는 순간을 "작업 완료(단계 6)"로 봄
+    # (DO10, DO11은 여기서 끄지 않음)
+    for i in range(1, 10):
+        set_digital_output(i, OFF)
+
+
+# =====================================================
+#  메인 프로그램
+# =====================================================
+
+# --- 시작할 때: 홈으로 이동하면서 그리퍼 열기 ---
+set_digital_output(GRIP_CLOSE, OFF)   # 잡기 끄기
+set_digital_output(GRIP_OPEN, ON)     # 열기 켜기 (이동하는 동안 열림)
+moving_off()                          # 11번(이동 중 신호) 꺼두기
+go_home()                             # 홈으로 이동
+
+while True:                          # 신호를 계속 기다리며 반복
+    if get_digital_output(DO_RESET) == ON:   # DO12가 켜지면
+        go_home()                            # 홈으로 이동
+        wait(0.1)
+        continue                             # 꺼질 때까지 홈에서 대기 (작업 시작 안 함)
+
+    s = read_slot()                  # 몇 번칸 신호가 켜졌는지 (0~5, 없으면 -1)
+    rent = get_digital_output(DO_RENT)     # 대여 신호
+    ret = get_digital_output(DO_RETURN)    # 반납 신호
+    bad = get_digital_output(DO_BROKEN)    # 고장 신호
+
+    # 칸 신호 + 동작 신호가 둘 다 들어왔을 때만 동작 시작 (단계 1)
+    if s >= 0 and (rent or ret or bad):
+
+        if ret:                                  # [반납] System_wait -> 해당 칸
+            grip_open()                                      # 그리퍼 열기 (이동 전에)
+            moving_on()                                      # DO11 켜기 : 1번째 이동 (단계 2)
+            go_wait_app(System_wait)                         # 홈 -> 경유 위치 -> System_wait 접근 위치
+            moving_off()                                     # DO11 끄기 : 접근 위치 도착
+            wait_plc_go()                                    # PLC의 DO10이 켜질 때까지 대기
+            movel(System_wait, vel=50, acc=100)              # DO10 켜짐: System_wait로 천천히 내려감
+            grip_close()                                     # 배터리 잡기 (단계 3)
+            movel(app_base(System_wait), vel=50, acc=100)    # 접근 위치까지 다 올라옴
+            set_digital_output(DO_WAIT_GO, OFF)              # DO10 끄기
+            moving_on()                                      # DO11 켜기 : 2번째 이동 (단계 4)
+            back_home_from_wait()                            # 접근 위치 -> 경유 위치 -> 홈
+            movel(app_tool(slots[s]), vel=200, acc=300)      # 칸의 접근 위치에 도달
+            moving_off()                                     # DO11 끄기
+            movel(slots[s], vel=50, acc=100)                 # 칸에 천천히 넣기=충전기 꽂기
+            grip_open()                                      # 배터리 놓기 (단계 5)
+            movel(app_tool(slots[s]), vel=50, acc=100)       # 접근 위치로 빠져나옴
+            go_home()                                        # 홈 복귀
+
+        elif rent:                               # [대여] 해당 칸 -> System_rent_wait
+            pick_from(slots[s], app_tool)                    # 1번째 이동(단계 2) + 칸에서 빼기(단계 3)
+            moving_on()                                      # DO11 켜기 : 2번째 이동 (단계 4)
+            go_home()                                        # 홈 경유
+            go_wait_app(System_rent_wait)                    # 홈 -> 경유 위치 -> rent_wait 접근 위치
+            wait_plc_go()                                    # PLC의 DO10이 켜질 때까지 대기
+            moving_off()                                     # DO10 들어옴: DO11 끄기
+            movel(System_rent_wait, vel=50, acc=100)         # rent_wait로 천천히 내려감
+            grip_open()                                      # 배터리 놓기 (단계 5)
+            movel(app_base(System_rent_wait), vel=50, acc=100)   # 접근 위치까지 다 올라옴
+            set_digital_output(DO_WAIT_GO, OFF)              # DO10 끄기 (홈 가기 전에)
+            back_home_from_wait()                            # 접근 위치 -> 경유 위치 -> 홈
+
+        elif bad:                                # [고장] 해당 칸 -> broken 위치
+            pick_from(slots[s], app_tool)                    # 1번째 이동(단계 2) + 칸에서 빼기(단계 3)
+            moving_on()                                      # DO11 켜기 : 2번째 이동 (단계 4)
+            go_home()                                        # 홈 경유
+            movel(app_base(System_broken), vel=150, acc=300) # broken의 접근 위치에 도달
+            moving_off()                                     # DO11 끄기
+            movel(System_broken, vel=50, acc=100)            # broken으로 천천히 들어감
+            grip_open()                                      # 배터리 놓기 (단계 5)
+            movel(app_base(System_broken), vel=50, acc=100)  # 접근 위치로 빠져나옴
+            go_home()                                        # 홈 복귀
+
+        moving_off()                 # 혹시 남아 있으면 DO11 끄기
+        clear_signals()              # DO1~9 끄기 -> PLC가 완료(단계 6)로 인식
+
+    wait(0.1)                        # 0.1초마다 신호 확인
